@@ -38,7 +38,8 @@ class Embeddings(nn.Module):
         x = self.embeddings(input_ids) # ~570us on CPU for 512 tokens.
         if self.config.match_hf and isinstance(self.norm, LayerNorm):
             # bc1s LayerNorm introduces a slight numerical accuracy drift.
-            return F.layer_norm(x, (x.size()[-1],), self.norm.weight, self.norm.bias, self.norm.eps).transpose(-1,-2).unsqueeze(2)
+            # return F.layer_norm(x, (x.size()[-1],), self.norm.weight, self.norm.bias, self.norm.eps).transpose(-1,-2).unsqueeze(2)
+            return F.layer_norm(x, (self.config.hidden_size,), self.norm.weight, self.norm.bias, self.norm.eps).transpose(-1,-2).unsqueeze(2)
         x = x.transpose(-1,-2).unsqueeze(2) # to bc1s
         return self.norm(x)
 
@@ -58,7 +59,7 @@ class Attention(nn.Module):
 
         self.out = nn.Conv2d(config.hidden_size, config.hidden_size, kernel_size=1, bias=False)
 
-    def forward(self, x, position_ids, attention_mask, sliding_window_mask=None):
+    def forward(self, x, position_ids, attention_mask, sliding_window_mask=None, sin=None, cos=None):
         """
         x: (bs, hidden_size, 1, seq_length)
         position_ids: (bs, seq_length)
@@ -71,14 +72,16 @@ class Attention(nn.Module):
             qkv = F.linear(x.squeeze(2).transpose(-2,-1), self.qkv.weight.squeeze()).transpose(-2,-1).unsqueeze(2)
         else:
             qkv = self.qkv(x)
+        return self.split_attention(qkv, self._attention_mask(attention_mask, sliding_window_mask), sin, cos, headdim=self.dim_head)
         q,k,v = qkv.chunk(3, dim=1)
         q = q.view(b, self.config.num_heads, self.dim_head, s)
         k = k.view(b, self.config.num_heads, self.dim_head, s)
         v = v.view(b, self.config.num_heads, self.dim_head, s)
 
         # RoPE
-        cos, sin = self.rotary_emb(x, position_ids=position_ids)
-        cos, sin = cos.transpose(-1,-2), sin.transpose(-1 ,-2)
+        if sin is None:
+            cos, sin = self.rotary_emb(x, position_ids=position_ids)
+            cos, sin = cos.transpose(-1,-2), sin.transpose(-1 ,-2)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # Switch between global or local attention as appropriate.
@@ -86,6 +89,33 @@ class Attention(nn.Module):
 
         attn = self.original_attn(q, k, v, mask, self.config.num_heads, self.dim_head)
         return self.out(attn)
+
+    def split_attention(self, qkv, attention_mask, sin, cos, headdim):
+        """
+            I think attentions that use reshape are not Enumerated Shape compatible, thus we
+            have to use this which splits the heads into many tensors instead of using reshapes
+        """
+        qkv = qkv.squeeze(2)
+        all_heads = torch.split(qkv, self.dim_head, 1) # [(bsz, hidden_dim, length)] * 3 * num_heads
+        qheads, kheads, vheads = all_heads[:self.config.num_heads], all_heads[self.config.num_heads:-self.config.num_heads], all_heads[-self.config.num_heads:]
+        attns = []
+        for i in range(self.config.num_heads):
+            qh = qheads[i]
+            kh = kheads[i]
+            vh = vheads[i]
+
+            qh, kh = apply_rotary_pos_emb(qh, kh, cos, sin, headdim=headdim)
+            scores = qh.transpose(-1, -2) @ kh
+            scores *= self.dim_head
+            scores += attention_mask
+            weights = scores.softmax(-1)
+            attn = vh @ weights
+            attns.append(attn) # (1, headdim, sequence_length)
+        
+        attn = torch.concat(attns, dim=1).unsqueeze(-2)
+        out = self.out(attn)
+        return out
+
 
     @staticmethod
     def original_attn(q, k, v, mask, heads, dim_head):
@@ -143,6 +173,7 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: Config, layer_index: int):
         super().__init__()
+        self.config = config
         self.layer_index = layer_index
         self.pre_attn_norm = LayerNorm(config.hidden_size, eps=config.norm_eps, bias=config.norm_bias) if layer_index != 0 else nn.Identity()
         self.attn = Attention(config, layer_index)
@@ -151,8 +182,14 @@ class Block(nn.Module):
         # Optional transform for residual connection. Useful if applying QuaRot-style rotations.
         self.residual_transform = nn.Identity()
 
-    def forward(self, x, position_ids, attention_mask, sliding_window_mask=None):
-        x = self.residual_transform(x) + self.attn(self.pre_attn_norm(x), position_ids, attention_mask, sliding_window_mask)
+    def forward(self, x, position_ids, attention_mask, sliding_window_mask=None, global_sin=None, global_cos=None, local_sin=None, local_cos=None):
+        if self.layer_index % self.config.global_attn_every_n_layers == 0:
+            sin = global_sin
+            cos = global_cos
+        else:
+            sin = local_sin
+            cos = local_cos
+        x = self.residual_transform(x) + self.attn(self.pre_attn_norm(x), position_ids, attention_mask, sliding_window_mask, sin=sin, cos=cos)
         return x + self.mlp(self.pre_mlp_norm(x))
 
 class MaskedLMHead(nn.Module):
@@ -178,12 +215,17 @@ class Model(nn.Module):
         self.head = head(config) if head else nn.Identity()
         self.unrotate = nn.Identity()
 
-    def forward(self, x, attention_mask):
-        sliding_window_mask = Attention.sliding_window_mask(self.config, attention_mask) # Do all CPU work first.
+    def forward(self, x, attention_mask, global_sin=None, global_cos=None, local_sin=None, local_cos=None, sliding_window_mask=None):
+        if sliding_window_mask is None:
+            sliding_window_mask = Attention.sliding_window_mask(self.config, attention_mask) # Do all CPU work first.
         x = self.embeddings(x)
-        position_ids = torch.arange(x.shape[-1], device=x.device).unsqueeze(0)
+        if global_sin is None:
+            position_ids = torch.arange(x.shape[-1], device=x.device).unsqueeze(0)
+        else:
+            position_ids = None
         for layer in self.layers:
-            x = layer(x, position_ids, attention_mask, sliding_window_mask)
+            x = layer(x, position_ids, attention_mask, sliding_window_mask, global_sin=global_sin, global_cos=global_cos, local_sin=local_sin, local_cos=local_cos)
+        return x
         x = self.ln_f(x)
         x = self.unrotate(x)
         return self.head(x) # MaskedLM, Classification, etc. or no-op
@@ -269,6 +311,9 @@ class LayerNorm(nn.Module):
                 out = out * self.weight.view(1, self.num_channels, 1, 1)
 
         return out
+    
+    def stable_forward(self, inputs):
+        pass
 
     def __repr__(self):
         return f'LayerNorm(({self.num_channels},), eps={self.eps}, elementwise_affine={self.elementwise_affine})'
@@ -332,17 +377,18 @@ class ModernBertRotaryEmbedding(nn.Module):
             sin = emb.sin()
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
-def rotate_half(x):
-    # Modified for BC1S tensor shape.
-    x1 = x[:, :, : x.shape[-2] // 2, :]  # (B, nh, hs/2, T)
-    x2 = x[:, :, x.shape[-2] // 2 :, :]  # (B, nh, hs/2, T)
-    return torch.cat((-x2, x1), dim=-2)  # (B, nh, hs, T)
+def rotate_half(x, headdim=None):
+    if headdim is None:
+        headdim = x.shape[-2]
+    x1 = x[:, : headdim // 2, :]
+    x2 = x[:, headdim // 2 :, :]
+    return torch.cat((-x2, x1), dim=-2)
 
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1, headdim=None):
+    # cos = cos.unsqueeze(unsqueeze_dim)
+    # sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q, headdim=headdim) * sin)
+    k_embed = (k * cos) + (rotate_half(k, headdim=headdim) * sin)
     return q_embed, k_embed
 
 # Orthogonal Rotation
